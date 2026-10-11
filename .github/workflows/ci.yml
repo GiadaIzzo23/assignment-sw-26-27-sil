@@ -3,14 +3,20 @@ name: SIL
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    name: Build and test (Release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -18,5 +24,43 @@ jobs:
       - name: Install Ninja
         run: sudo apt-get update && sudo apt-get install --yes ninja-build
 
-      - name: SIL workflow
+      - name: Show tool versions
+        run: |
+          cmake --version
+          g++ --version
+          ninja --version
+
+      - name: Configure, build and test
         run: cmake --workflow --preset sil
+
+  thread-sanitizer:
+    name: Tests under ThreadSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install --yes ninja-build
+
+      # Some runner kernels use an address-space layout that older
+      # ThreadSanitizer runtimes cannot map; lowering the ASLR entropy
+      # avoids a spurious start-up failure.
+      - name: Relax ASLR for ThreadSanitizer
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-tsan -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build
+        run: cmake --build build-tsan
+
+      - name: Test
+        run: ctest --test-dir build-tsan --output-on-failure
+        env:
+          TSAN_OPTIONS: halt_on_error=1 exitcode=66

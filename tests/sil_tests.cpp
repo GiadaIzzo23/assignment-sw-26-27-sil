@@ -683,6 +683,50 @@ void test_ebs_each_input_goes_stale(TestContext& context) {
   }
 }
 
+void test_ebs_missing_inputs_from_start(TestContext& context) {
+  struct MissingCase {
+    const char* name;
+    bool vehicle;
+    bool pressure;
+    bool command;
+  };
+  const MissingCase missing_cases[] = {
+      {"EBS missing: no input frame ever arrives", false, false, false},
+      {"EBS missing: VEHICLE_STATUS never arrives", false, true, true},
+      {"EBS missing: BRAKE_PRESSURE never arrives", true, false, true},
+      {"EBS missing: EBS_COMMAND never arrives", true, true, false},
+  };
+
+  for (const MissingCase& missing_case : missing_cases) {
+    SilSystem system;
+    configure_nominal_inputs(system);  // sensors fine: only the bus is lacking
+    system.start();
+
+    EbsInputs inputs;
+    inputs.send_vehicle = missing_case.vehicle;
+    inputs.send_pressure = missing_case.pressure;
+    inputs.send_command = missing_case.command;
+
+    bool ok = drive_until(system, inputs, [&] { return ebs_safe(system, 1U); });
+
+    // It must not drift into the nominal state afterwards.
+    bool stays_safe = true;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() < deadline) {
+      inputs.publish(system);
+      stays_safe = stays_safe && ebs_safe(system, 1U);
+      std::this_thread::sleep_for(kTick);
+    }
+    ok = ok && stays_safe;
+    if (!ok) {
+      print_ebs_outputs(system);
+    }
+    context.expect(ok, missing_case.name);
+    system.stop();
+  }
+}
+
 void test_ebs_live_sensor_and_frame_changes(TestContext& context) {
   SilSystem system;
   configure_nominal_inputs(system);
@@ -964,6 +1008,7 @@ int main() {
   test_ebs_cases(context);
   test_ebs_stays_nominal_with_refreshed_inputs(context);
   test_ebs_each_input_goes_stale(context);
+  test_ebs_missing_inputs_from_start(context);
   test_ebs_live_sensor_and_frame_changes(context);
   test_ebs_status_frame(context);
   test_both_ecus_publish_periodically(context);
