@@ -88,10 +88,6 @@ one.
   timeout, SMU frames delivered to the EBS, EBS frames *not* looped back, drop
   oldest on a full queue, double start/stop, restart, destruction while
   running.
-- **Checked against faulty ECUs.** I also ran the suite against hand-made
-  faulty copies of the ECUs (flipped comparisons, changed thresholds, ignored
-  inputs, swapped pressure pairs). 13 of 15 were detected; the other two are
-  behaviourally equivalent to the original and cannot be detected.
 
 ## CI
 
