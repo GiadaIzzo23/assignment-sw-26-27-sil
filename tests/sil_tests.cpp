@@ -1,6 +1,8 @@
 #include "sil.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <thread>
@@ -400,6 +402,14 @@ const SmuCase kSmuCases[] = {
      4000, 0, 0, 2},
     {"SMU: brake is still published while an APP fault inhibits throttle",
      3500, 3490, 1000, 0, 100, 1},
+    // Calibration end points of APP1/APP2 (a wrong constant shifts these by
+    // one percentage point, which flips the 10-point plausibility check).
+    {"SMU: APP2 near full end: 80% vs 90% is plausible", 3200, 2591, 4000, 80,
+     0, 0},
+    {"SMU: APP2 near zero end: 20% vs 30% is plausible", 3800, 3191, 4000, 20,
+     0, 0},
+    {"SMU: APP1 near full end gives 99%", 3010, 2510, 4000, 99, 0, 0},
+    {"SMU: APP1 near zero end gives 1%", 3990, 3490, 4000, 1, 0, 0},
 };
 
 void test_smu_cases(TestContext& context) {
@@ -992,6 +1002,285 @@ void test_lifecycle_edge_cases(TestContext& context) {
   }
 }
 
+
+// ===========================================================================
+// Additional tests for bus routing, queue bounds, malformed frames and concurrency.
+// ===========================================================================
+
+// A frame with an id the ECUs ignore; used to probe the bus without side effects.
+Frame probe_frame(const std::uint8_t sequence) {
+  Frame frame = raceup::sil::make_frame(0x7F0U, 1U);
+  frame.data[0] = sequence;
+  return frame;
+}
+
+void drain_monitor(SilSystem& system) {
+  Frame frame{};
+  while (system.receive_frame(frame, std::chrono::milliseconds(0))) {
+  }
+}
+
+// receive_frame must be WOKEN by a new frame, not just time out and re-check.
+void test_receive_frame_wakes_up_promptly(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  system.start();
+  drain_monitor(system);
+
+  Frame frame{};
+  const auto begin = std::chrono::steady_clock::now();
+  const bool received = system.receive_frame(frame, std::chrono::milliseconds(2000));
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  context.expect(received, "bus: receive_frame with a long timeout returns a frame");
+  context.expect(elapsed < std::chrono::milliseconds(500),
+                 "bus: receive_frame is woken by the new frame (no waiting for the timeout)");
+  system.stop();
+}
+
+// The monitor queue is FIFO: frames come out in the order they were written.
+void test_monitor_queue_is_fifo(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  system.start();
+  drain_monitor(system);
+
+  for (std::uint8_t sequence = 1U; sequence <= 5U; ++sequence) {
+    ecu_io::write(Ecu::Ebs, probe_frame(sequence));
+  }
+  std::vector<std::uint8_t> order;
+  const auto deadline = std::chrono::steady_clock::now() + kWait;
+  while (order.size() < 5U && std::chrono::steady_clock::now() < deadline) {
+    Frame frame{};
+    if (system.receive_frame(frame, std::chrono::milliseconds(20)) &&
+        frame.id == 0x7F0U) {
+      order.push_back(frame.data[0]);
+    }
+  }
+  const bool in_order = order == std::vector<std::uint8_t>{1U, 2U, 3U, 4U, 5U};
+  context.expect(in_order, "bus: monitor queue delivers frames oldest first");
+  system.stop();
+}
+
+// Nobody drains the monitor queue for a while: it must stay bounded (64 is the
+// starter's kQueueCapacity) and keep the newest frames.
+void test_monitor_queue_is_bounded(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  system.start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(900));  // ~180 frames written
+  for (std::uint8_t sequence = 1U; sequence <= 3U; ++sequence) {
+    ecu_io::write(Ecu::Ebs, probe_frame(sequence));
+  }
+
+  // Stop first: the queues survive stop(), and the ECUs can no longer add
+  // frames while we count (which would make the count race with the writers).
+  system.stop();
+  std::size_t count = 0;
+  std::uint8_t last_probe = 0U;
+  Frame frame{};
+  while (system.receive_frame(frame, std::chrono::milliseconds(0))) {
+    ++count;
+    if (frame.id == 0x7F0U) {
+      last_probe = frame.data[0];
+    }
+  }
+  context.expect(count == 64U, "bus: an undrained monitor queue holds exactly its 64-frame capacity");
+  context.expect(last_probe == 3U, "bus: a full monitor queue keeps the newest frames");
+}
+
+// Precisely which frame is dropped when the EBS input queue overflows:
+// a brake request sent FIRST must be evicted only once more than 64 frames follow.
+void run_overflow_case(const int fillers, const bool request_survives,
+                       TestContext& context, const char* name) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  system.send_frame(ebs_command(true, false));  // the oldest frame
+  for (int i = 0; i < fillers; ++i) {
+    system.send_frame(vehicle_status(false, true, 0U));
+  }
+  system.send_frame(brake_pressure(40U, 40U, 8U, 8U));
+  system.start();
+
+  bool saw_brake_request = false;  // fault 6
+  bool saw_missing_command = false;  // fault 1 (no EBS_COMMAND seen)
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto fault = system.output(OutputId::EbsFaultCode);
+    saw_brake_request = saw_brake_request || fault == 6U;
+    saw_missing_command = saw_missing_command || fault == 1U;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  system.stop();
+  context.expect(request_survives ? saw_brake_request && !saw_missing_command
+                                  : saw_missing_command && !saw_brake_request,
+                 name);
+}
+
+void test_ebs_input_queue_capacity(TestContext& context) {
+  run_overflow_case(40, true, context,
+                    "bus: 42 queued frames all fit: the oldest one is still delivered");
+  run_overflow_case(70, false, context,
+                    "bus: after 72 queued frames the oldest one has been discarded");
+}
+
+// The SMU has no input queue: it must never be able to take the EBS's frames.
+void test_smu_cannot_read_ebs_input(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  system.start();
+  bool smu_got_frame = false;
+  for (std::uint8_t i = 0U; i < 200U; ++i) {
+    system.send_frame(probe_frame(i));
+    Frame frame{};
+    smu_got_frame = smu_got_frame || ecu_io::try_read(Ecu::Smu, frame);
+  }
+  system.stop();
+  context.expect(!smu_got_frame, "bus: try_read for the SMU never returns a frame");
+}
+
+// Frames that are too short (DLC) or have an unknown id must NOT count as fresh.
+void test_ebs_ignores_malformed_frames(TestContext& context) {
+  const std::uint32_t ids[3] = {can_id::VehicleStatus, can_id::BrakePressure,
+                                can_id::EbsCommand};
+  const std::uint8_t full_dlc[3] = {3U, 4U, 2U};
+  const char* names[3] = {
+      "EBS malformed: VEHICLE_STATUS with a short DLC is ignored",
+      "EBS malformed: BRAKE_PRESSURE with a short DLC is ignored",
+      "EBS malformed: EBS_COMMAND with a short DLC is ignored"};
+
+  for (int broken = 0; broken < 3; ++broken) {
+    SilSystem system;
+    configure_nominal_inputs(system);
+    system.start();
+
+    bool stayed_open = true;   // ASNode must never close
+    bool reached_safe = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline) {
+      EbsInputs inputs;
+      inputs.publish_to([&](Frame frame) {
+        for (int i = 0; i < 3; ++i) {
+          if (frame.id == ids[i] && i == broken) {
+            frame.dlc = static_cast<std::uint8_t>(full_dlc[i] - 1U);
+          }
+        }
+        system.send_frame(frame);
+      });
+      stayed_open = stayed_open && system.output(OutputId::EbsAsNodeClosed) == 0U;
+      reached_safe = reached_safe || ebs_safe(system, 1U);
+      std::this_thread::sleep_for(kTick);
+    }
+    context.expect(stayed_open && reached_safe, names[broken]);
+    system.stop();
+  }
+}
+
+// "Missing critical input => safe" must hold from the very first cycle, not only
+// after the staleness timeout.
+void test_ebs_safe_from_the_first_cycle(TestContext& context) {
+  struct MissingCase {
+    const char* name;
+    bool vehicle, pressure, command;
+  };
+  const MissingCase cases[] = {
+      {"EBS boot: ASNode never closes if EBS_COMMAND never arrives", true, true, false},
+      {"EBS boot: ASNode never closes if BRAKE_PRESSURE never arrives", true, false, true},
+      {"EBS boot: ASNode never closes if VEHICLE_STATUS never arrives", false, true, true},
+  };
+  for (const MissingCase& test_case : cases) {
+    SilSystem system;
+    configure_nominal_inputs(system);
+    system.start();
+    EbsInputs inputs;
+    inputs.send_vehicle = test_case.vehicle;
+    inputs.send_pressure = test_case.pressure;
+    inputs.send_command = test_case.command;
+
+    bool never_closed = true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(450);
+    while (std::chrono::steady_clock::now() < deadline) {
+      inputs.publish(system);
+      never_closed = never_closed && system.output(OutputId::EbsAsNodeClosed) == 0U;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    context.expect(never_closed, test_case.name);
+    system.stop();
+  }
+}
+
+// A new SIL run must not inherit the previous run's EBS memory.
+void test_ebs_state_is_reset_between_runs(TestContext& context) {
+  {
+    SilSystem first;
+    configure_nominal_inputs(first);
+    first.start();
+    EbsInputs inputs;
+    drive_until(first, inputs, [&] { return ebs_nominal(first); });
+    first.stop();  // stopped while fully nominal with fresh inputs
+  }
+  SilSystem second;
+  configure_nominal_inputs(second);
+  second.start();  // no frames at all
+  bool never_closed = true;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+  while (std::chrono::steady_clock::now() < deadline) {
+    never_closed = never_closed && second.output(OutputId::EbsAsNodeClosed) == 0U;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  context.expect(never_closed, "lifecycle: a new run starts with no memory of the previous inputs");
+  second.stop();
+}
+
+// Several threads use the public API at once while both ECUs run. Mostly useful
+// under ThreadSanitizer (the CI job), but it also checks the values stay sane.
+void test_concurrent_api_use(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  system.start();
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> sane{true};
+  std::thread writer([&] {  // moves the pedals back and forth
+    std::uint16_t raw = 3600U;
+    while (!stop.load()) {
+      raw = static_cast<std::uint16_t>(raw == 3600U ? 3400U : 3600U);
+      system.set_sensor(SensorId::SmuApps1Raw, raw);
+      system.set_sensor(SensorId::SmuApps2Raw, static_cast<std::uint16_t>(raw - 500U));
+    }
+  });
+  std::thread sender([&] {  // keeps the EBS fed
+    const EbsInputs inputs;
+    while (!stop.load()) {
+      inputs.publish(system);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  std::thread reader([&] {  // reads outputs continuously
+    while (!stop.load()) {
+      if (system.output(OutputId::SmuThrottlePercent) > 100U) {
+        sane = false;
+      }
+      (void)system.output(OutputId::EbsFaultCode);
+    }
+  });
+
+  int frames = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+  while (std::chrono::steady_clock::now() < deadline) {
+    Frame frame{};
+    if (system.receive_frame(frame, std::chrono::milliseconds(10))) {
+      ++frames;
+    }
+  }
+  stop = true;
+  writer.join();
+  sender.join();
+  reader.join();
+  system.stop();
+  context.expect(sane.load() && frames > 0,
+                 "concurrency: simultaneous set_sensor/send_frame/output/receive_frame stay consistent");
+}
+
 }  // namespace
 
 int main() {
@@ -1017,6 +1306,17 @@ int main() {
   test_ebs_written_frames_are_not_routed_to_ebs(context);
   test_ebs_input_queue_discards_oldest(context);
   test_lifecycle_edge_cases(context);
+
+  // Review additions
+  test_receive_frame_wakes_up_promptly(context);
+  test_monitor_queue_is_fifo(context);
+  test_monitor_queue_is_bounded(context);
+  test_ebs_input_queue_capacity(context);
+  test_smu_cannot_read_ebs_input(context);
+  test_ebs_ignores_malformed_frames(context);
+  test_ebs_safe_from_the_first_cycle(context);
+  test_ebs_state_is_reset_between_runs(context);
+  test_concurrent_api_use(context);
 
   if (context.failures != 0) {
     std::printf("%d test assertion(s) failed\n", context.failures);
